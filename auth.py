@@ -51,6 +51,14 @@ def _set_cached_user(user_id: str, user):
         _auth_user_cache[user_id] = (time.time() + ttl, user)
 
 
+def invalidate_cached_user(user_id: str) -> None:
+    """Remove a user snapshot from auth cache, used on logout/password reset flows."""
+    if not user_id:
+        return
+    with _auth_user_cache_lock:
+        _auth_user_cache.pop(user_id, None)
+
+
 def _get_secret_key() -> str:
     """Load JWT secret from environment after dotenv is initialized."""
     secret_key = os.getenv('SECRET_KEY')

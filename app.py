@@ -10,7 +10,7 @@ import jwt
 import json
 from urllib.parse import urlsplit
 from threading import Lock
-from auth import token_required, role_required, superadmin_required
+from auth import token_required, role_required, superadmin_required, invalidate_cached_user
 from superadmin_routes import ensure_default_superadmin
 
 load_dotenv()
@@ -501,6 +501,23 @@ def get_current_user():
             }
         }), 200
     
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+@token_required
+def logout():
+    """Logout current user by clearing server-side auth cache snapshot."""
+    try:
+        user_id = request.current_user.get('id')
+        invalidate_cached_user(user_id)
+
+        return jsonify({
+            'success': True,
+            'message': 'Logged out successfully'
+        }), 200
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
