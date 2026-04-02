@@ -27,7 +27,9 @@ def get_notifications():
         notification_type = request.args.get('type')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
-        
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
+
         # Get user's notification preferences
         with db_connection.get_cursor() as cursor:
             cursor.execute("""

@@ -25,7 +25,19 @@ def get_all_reports():
         
         # Build query
         query = """
-            SELECT r.*, 
+            SELECT
+                   r.id,
+                   r.user_id,
+                   r.zone_id,
+                   r.description,
+                   r.severity,
+                   r.status,
+                   CASE WHEN r.image_url LIKE 'data:%' THEN NULL ELSE r.image_url END AS image_url,
+                   CASE WHEN r.after_image_url LIKE 'data:%' THEN NULL ELSE r.after_image_url END AS after_image_url,
+                   r.latitude,
+                   r.longitude,
+                   r.created_at,
+                   r.completed_at,
                    u.name as user_name,
                    z.name as zone_name,
                    cu.name as cleaner_name
@@ -100,7 +112,19 @@ def get_pending_reports():
 
         with db_connection.get_cursor() as cursor:
             cursor.execute("""
-                SELECT r.*, 
+                SELECT
+                       r.id,
+                       r.user_id,
+                       r.zone_id,
+                       r.description,
+                       r.severity,
+                       r.status,
+                       NULL::text AS image_url,
+                       NULL::text AS after_image_url,
+                       r.latitude,
+                       r.longitude,
+                       r.created_at,
+                       r.completed_at,
                        u.name as user_name,
                        z.name as zone_name
                 FROM reports r

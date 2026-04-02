@@ -158,7 +158,9 @@ def get_my_reports():
         status = request.args.get('status')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
-        
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
+
         # Build query
         where_clause = "WHERE r.user_id = %s"
         params = [user_id]
@@ -170,9 +172,15 @@ def get_my_reports():
         with db_connection.get_cursor() as cursor:
             # Get reports
             cursor.execute(f"""
-                SELECT 
-                    r.id, r.description, r.severity, r.status, r.image_url, 
-                    r.after_image_url, r.created_at, r.completed_at,
+                SELECT
+                    r.id,
+                    r.description,
+                    r.severity,
+                    r.status,
+                    CASE WHEN r.image_url LIKE 'data:%' THEN NULL ELSE r.image_url END AS image_url,
+                    CASE WHEN r.after_image_url LIKE 'data:%' THEN NULL ELSE r.after_image_url END AS after_image_url,
+                    r.created_at,
+                    r.completed_at,
                     z.name as zone_name,
                     u.name as cleaner_name,
                     cr.rating as citizen_rating,
