@@ -18,6 +18,9 @@ def get_all_tasks():
         cleaner_id = request.args.get('cleaner_id')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
         
         # Build query
         where_clause = "WHERE 1=1"
@@ -46,11 +49,11 @@ def get_all_tasks():
                     t.id, t.report_id, t.zone_id, t.cleaner_id,
                     t.description, t.priority, t.status, t.reward,
                     t.due_date, t.created_at, t.taken_at, t.completed_at,
-                    t.evidence_image_url,
+                    CASE WHEN t.evidence_image_url LIKE 'data:%%' THEN NULL ELSE t.evidence_image_url END AS evidence_image_url,
                     z.name as zone_name,
                     c.name as cleaner_name,
-                    r.image_url as before_image_url,
-                    r.after_image_url as report_after_image_url,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS before_image_url,
+                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS report_after_image_url,
                     wa.description as ai_description,
                     wa.severity as ai_severity,
                     wa.estimated_volume,

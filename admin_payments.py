@@ -75,6 +75,9 @@ def get_pending_payments():
         cleaner_id = request.args.get('cleaner_id')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
         
         # Build query
         where_clause = "WHERE et.status = 'PENDING'"
@@ -97,8 +100,8 @@ def get_pending_payments():
                     t.status as task_status,
                     r.id as report_id,
                     r.description as report_description,
-                    r.image_url as before_image_url,
-                    r.after_image_url,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS before_image_url,
+                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS after_image_url,
                     r.latitude,
                     r.longitude,
                     cr.rating as review_rating,

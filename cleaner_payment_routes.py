@@ -18,6 +18,9 @@ def get_earnings_history():
         status = request.args.get('status')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
         
         # Build query
         where_clause = "WHERE et.cleaner_id = %s"
@@ -260,7 +263,7 @@ def get_withdrawal_history():
         limit = request.args.get('limit', type=int, default=30)
         offset = request.args.get('offset', type=int, default=0)
 
-        limit = max(1, min(limit, 200))
+        limit = max(1, min(limit, 50))
         offset = max(0, offset)
 
         with db_connection.get_cursor() as cursor:

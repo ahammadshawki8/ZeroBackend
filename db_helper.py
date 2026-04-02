@@ -140,6 +140,21 @@ class DatabaseConnection:
             return False
         return not bool(getattr(pool, 'closed', False))
 
+    def _close_pool_safely(self) -> None:
+        """Close current pool object defensively to avoid leaked sessions."""
+        pool = self.connection_pool
+        if pool is None:
+            return
+        try:
+            if PSYCOPG_VERSION == 3:
+                pool.close()
+            else:
+                pool.closeall()
+        except Exception as close_error:
+            print(f"Pool close warning: {close_error}")
+        finally:
+            self.connection_pool = None
+
     def _ensure_pool(self) -> None:
         """Create or recreate the pool lazily when it is missing or closed."""
         if self._pool_is_usable():
@@ -149,7 +164,8 @@ class DatabaseConnection:
             if self._pool_is_usable():
                 return
 
-            self.connection_pool = None
+            # If a stale pool object exists, close it before creating a new one.
+            self._close_pool_safely()
             if not self.create_pool():
                 raise RuntimeError('Database connection pool is unavailable')
 
@@ -159,7 +175,8 @@ class DatabaseConnection:
         if PSYCOPG_VERSION == 3:
             self._ensure_pool()
             # psycopg3 uses connection context manager
-            for attempt in range(2):
+            retries = max(0, int(os.getenv('DB_POOL_ACQUIRE_RETRIES', '0')))
+            for attempt in range(retries + 1):
                 try:
                     with self.connection_pool.connection() as connection:
                         with connection.cursor(row_factory=dict_row) as cursor:
@@ -179,16 +196,27 @@ class DatabaseConnection:
                                 raise
                     return
                 except PoolTimeout:
-                    if attempt == 0:
+                    pool_stats = {}
+                    try:
+                        pool_stats = self.connection_pool.get_stats() if self.connection_pool else {}
+                    except Exception:
+                        pool_stats = {}
+
+                    print(
+                        f"Pool timeout while acquiring DB connection (max_conn={self.max_conn}, "
+                        f"attempt={attempt + 1}/{retries + 1}, stats={pool_stats})."
+                    )
+
+                    if attempt < retries:
                         time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
-                        self._ensure_pool()
                         continue
-                    print(f"Pool timeout while acquiring DB connection (max_conn={self.max_conn}).")
                     raise
                 except Exception as exc:
-                    if attempt == 0 and ('closed' in str(exc).lower() or 'none' in str(exc).lower()):
-                        self.connection_pool = None
+                    message = str(exc).lower()
+                    if attempt < retries and ('pool closed' in message or 'pool is closed' in message):
+                        self._close_pool_safely()
                         self._ensure_pool()
+                        time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
                         continue
                     raise
         else:

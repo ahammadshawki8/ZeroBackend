@@ -18,7 +18,7 @@ def get_available_tasks():
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
 
-        limit = max(1, min(limit, 100))
+        limit = max(1, min(limit, 50))
         offset = max(0, offset)
         
         # Build query
@@ -40,7 +40,7 @@ def get_available_tasks():
                     t.id, t.zone_id, t.description, t.priority, t.due_date, t.reward, t.created_at,
                     z.name as zone_name, z.cleanliness_score,
                     r.id as report_id, r.description as report_description, 
-                    r.image_url as report_image, r.severity,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS report_image, r.severity,
                     r.latitude, r.longitude,
                     u.name as reporter_name,
                     wa.description as ai_description,
@@ -174,6 +174,9 @@ def get_my_tasks():
         status = request.args.get('status')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
         
         # Build query
         where_clause = "WHERE t.cleaner_id = %s"
@@ -188,9 +191,11 @@ def get_my_tasks():
             cursor.execute(f"""
                 SELECT 
                     t.id, t.description, t.priority, t.status, t.reward, 
-                    t.due_date, t.taken_at, t.completed_at, t.evidence_image_url,
+                    t.due_date, t.taken_at, t.completed_at,
+                    CASE WHEN t.evidence_image_url LIKE 'data:%%' THEN NULL ELSE t.evidence_image_url END AS evidence_image_url,
                     z.name as zone_name,
-                    r.id as report_id, r.image_url as report_image,
+                    r.id as report_id,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS report_image,
                     u.name as reporter_name
                     ,cc.completion_percentage, cc.before_summary, cc.after_summary,
                     cc.quality_rating, cc.environmental_benefit, cc.verification_status,
