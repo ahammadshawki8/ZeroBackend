@@ -17,6 +17,12 @@ import os
 import time
 from threading import Lock
 
+try:
+    from flask import has_request_context, request
+except Exception:
+    has_request_context = None
+    request = None
+
 if PSYCOPG_VERSION == 3:
     DB_OPERATIONAL_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError)
 else:
@@ -37,6 +43,27 @@ def _is_transient_db_error(error: Exception) -> bool:
         'could not receive data from server',
     ]
     return any(marker in text for marker in transient_markers)
+
+
+def _diag_enabled() -> bool:
+    return os.getenv('DB_DIAG_LOG', 'true').lower() == 'true'
+
+
+def _diag_acquire_warn_ms() -> float:
+    return float(os.getenv('DB_DIAG_ACQUIRE_WARN_MS', '150'))
+
+
+def _diag_hold_warn_ms() -> float:
+    return float(os.getenv('DB_DIAG_HOLD_WARN_MS', '1000'))
+
+
+def _request_label() -> str:
+    try:
+        if has_request_context and has_request_context() and request is not None:
+            return f"{request.method} {request.path}"
+    except Exception:
+        pass
+    return 'non-request-context'
 
 class DatabaseConfig:
     """Holds connection configuration details for establishing PostgreSQL connections."""
@@ -178,8 +205,18 @@ class DatabaseConnection:
             retries = max(0, int(os.getenv('DB_POOL_ACQUIRE_RETRIES', '0')))
             for attempt in range(retries + 1):
                 try:
+                    acquire_started = time.perf_counter()
                     with self.connection_pool.connection() as connection:
+                        acquired_ms = (time.perf_counter() - acquire_started) * 1000
+                        route_label = _request_label()
+                        if _diag_enabled() and acquired_ms >= _diag_acquire_warn_ms():
+                            print(
+                                f"DB acquire slow ({acquired_ms:.1f} ms) route={route_label} "
+                                f"commit={commit} attempt={attempt + 1}/{retries + 1}"
+                            )
+
                         with connection.cursor(row_factory=dict_row) as cursor:
+                            operation_started = time.perf_counter()
                             try:
                                 yield cursor
                                 if commit:
@@ -194,6 +231,13 @@ class DatabaseConnection:
                                     print(f"Rollback skipped due to lost connection: {rollback_error}")
                                 print(f"Error during database operation: {e}")
                                 raise
+                            finally:
+                                hold_ms = (time.perf_counter() - operation_started) * 1000
+                                if _diag_enabled() and hold_ms >= _diag_hold_warn_ms():
+                                    print(
+                                        f"DB hold slow ({hold_ms:.1f} ms) route={route_label} "
+                                        f"commit={commit}"
+                                    )
                     return
                 except PoolTimeout:
                     pool_stats = {}
@@ -222,9 +266,19 @@ class DatabaseConnection:
         else:
             # psycopg2 manual connection management
             self._ensure_pool()
+            acquire_started = time.perf_counter()
             connection = self.connection_pool.getconn()
+            acquired_ms = (time.perf_counter() - acquire_started) * 1000
+            route_label = _request_label()
+            if _diag_enabled() and acquired_ms >= _diag_acquire_warn_ms():
+                print(
+                    f"DB acquire slow ({acquired_ms:.1f} ms) route={route_label} "
+                    f"commit={commit}"
+                )
+
             cursor = connection.cursor(cursor_factory=RealDictCursor)
             should_close_connection = False
+            operation_started = time.perf_counter()
             try:
                 yield cursor
                 if commit:
@@ -241,6 +295,12 @@ class DatabaseConnection:
                 print(f"Error during database operation: {e}")
                 raise
             finally:
+                hold_ms = (time.perf_counter() - operation_started) * 1000
+                if _diag_enabled() and hold_ms >= _diag_hold_warn_ms():
+                    print(
+                        f"DB hold slow ({hold_ms:.1f} ms) route={route_label} "
+                        f"commit={commit}"
+                    )
                 try:
                     cursor.close()
                 except Exception:
