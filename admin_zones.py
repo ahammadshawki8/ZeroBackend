@@ -15,6 +15,9 @@ def get_zones():
         # Get query parameters
         is_active = request.args.get('is_active')
         limit = request.args.get('limit', type=int)
+        if limit is None:
+            limit = 100
+        limit = max(1, min(limit, 200))
         
         # Build query
         where_clause = "WHERE 1=1"
@@ -36,12 +39,10 @@ def get_zones():
                 FROM zones z
                 {where_clause}
                 ORDER BY z.created_at DESC
+                LIMIT %s
             """
-            
-            if limit:
-                query += f" LIMIT {limit}"
-            
-            cursor.execute(query, params)
+
+            cursor.execute(query, params + [limit])
             zones = cursor.fetchall()
             
             # Get polygon points for each zone

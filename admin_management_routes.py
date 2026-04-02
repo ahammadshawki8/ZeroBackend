@@ -158,4 +158,148 @@ def get_system_stats():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@admin_bp.route('/dashboard-summary', methods=['GET'])
+@token_required
+@role_required('ADMIN')
+def get_dashboard_summary():
+    """Get lightweight dashboard aggregates for fast first paint."""
+    try:
+        with db_connection.get_cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'SUBMITTED') AS submitted,
+                    COUNT(*) FILTER (WHERE status = 'APPROVED') AS approved,
+                    COUNT(*) FILTER (WHERE status = 'IN_PROGRESS') AS in_progress,
+                    COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                    COUNT(*) FILTER (WHERE status = 'DECLINED') AS declined,
+                    COUNT(*) FILTER (
+                        WHERE status = 'SUBMITTED' AND severity IN ('HIGH', 'CRITICAL')
+                    ) AS critical_pending
+                FROM reports
+            """)
+            report_stats = cursor.fetchone() or {}
+
+            cursor.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE status = 'APPROVED' AND cleaner_id IS NULL) AS available,
+                    COUNT(*) FILTER (WHERE status = 'IN_PROGRESS') AS in_progress,
+                    COUNT(*) FILTER (WHERE status = 'COMPLETED') AS completed,
+                    COALESCE(SUM(reward), 0) AS total_rewards,
+                    COALESCE(SUM(CASE WHEN status = 'COMPLETED' THEN reward ELSE 0 END), 0) AS paid_out
+                FROM tasks
+            """)
+            task_stats = cursor.fetchone() or {}
+
+            cursor.execute("""
+                SELECT
+                    z.id AS zone_id,
+                    z.name AS zone_name,
+                    z.cleanliness_score,
+                    COALESCE(r.report_count, 0) AS reports
+                FROM zones z
+                LEFT JOIN (
+                    SELECT zone_id, COUNT(*) AS report_count
+                    FROM reports
+                    GROUP BY zone_id
+                ) r ON r.zone_id = z.id
+                ORDER BY z.name ASC
+            """)
+            reports_by_zone = cursor.fetchall() or []
+
+            cursor.execute("""
+                SELECT
+                    r.id,
+                    r.zone_id,
+                    r.description,
+                    r.severity,
+                    r.status,
+                    r.created_at,
+                    z.name AS zone_name,
+                    u.name AS user_name
+                FROM reports r
+                LEFT JOIN zones z ON z.id = r.zone_id
+                LEFT JOIN users u ON u.id = r.user_id
+                WHERE r.status = 'SUBMITTED'
+                ORDER BY r.created_at DESC
+                LIMIT 5
+            """)
+            pending_reports = cursor.fetchall() or []
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'report_stats': report_stats,
+                'task_stats': task_stats,
+                'reports_by_zone': reports_by_zone,
+                'pending_reports': pending_reports,
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@admin_bp.route('/debug/pool-health', methods=['GET'])
+@token_required
+@role_required('ADMIN')
+def get_pool_health():
+    """Get lightweight DB pool/session diagnostics for production debugging."""
+    try:
+        pool_stats = {}
+        pool = db_connection.connection_pool
+        if pool is not None and hasattr(pool, 'get_stats'):
+            try:
+                pool_stats = pool.get_stats() or {}
+            except Exception as stats_error:
+                pool_stats = {'stats_error': str(stats_error)}
+
+        with db_connection.get_cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'active') AS active_sessions,
+                    COUNT(*) FILTER (WHERE state = 'idle') AS idle_sessions,
+                    COUNT(*) FILTER (WHERE wait_event_type IS NOT NULL) AS waiting_sessions
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+            """)
+            session_counts = cursor.fetchone() or {}
+
+            cursor.execute("""
+                SELECT
+                    pid,
+                    usename,
+                    state,
+                    wait_event_type,
+                    wait_event,
+                    now() - query_start AS running_for,
+                    LEFT(query, 180) AS query
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND state = 'active'
+                ORDER BY query_start ASC
+                LIMIT 10
+            """)
+            active_queries = cursor.fetchall() or []
+
+        for row in active_queries:
+            running_for = row.get('running_for')
+            row['running_for'] = str(running_for) if running_for is not None else None
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'pool_stats': pool_stats,
+                'session_counts': session_counts,
+                'active_queries': active_queries,
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 

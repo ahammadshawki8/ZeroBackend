@@ -2,12 +2,25 @@ from flask import Blueprint, jsonify, request
 from auth import token_required, role_required
 from models import db_connection
 from decimal import Decimal
+from threading import Lock
 
 admin_payments_bp = Blueprint('admin_payments', __name__)
+
+_funding_tables_ready = False
+_funding_tables_lock = Lock()
+_wallet_operation_lock = Lock()
 
 
 def _ensure_funding_tables(cursor):
     """Create wallet tables lazily so feature works without manual migrations."""
+    global _funding_tables_ready
+    if _funding_tables_ready:
+        return
+
+    with _funding_tables_lock:
+        if _funding_tables_ready:
+            return
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_funds (
             id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -43,6 +56,8 @@ def _ensure_funding_tables(cursor):
         SELECT 0, 0, 0
         WHERE NOT EXISTS (SELECT 1 FROM system_funds)
     """)
+
+    _funding_tables_ready = True
 
 
 def _get_wallet_row(cursor, lock=False):
@@ -100,8 +115,8 @@ def get_pending_payments():
                     t.status as task_status,
                     r.id as report_id,
                     r.description as report_description,
-                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS before_image_url,
-                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS after_image_url,
+                    r.image_url as before_image_url,
+                    r.after_image_url as after_image_url,
                     r.latitude,
                     r.longitude,
                     cr.rating as review_rating,
@@ -165,7 +180,15 @@ def get_pending_payments():
 @role_required('ADMIN')
 def process_payments():
     """Confirm pending cleaner payouts after admin verification."""
+    lock_acquired = False
     try:
+        lock_acquired = _wallet_operation_lock.acquire(blocking=False)
+        if not lock_acquired:
+            return jsonify({
+                'success': False,
+                'error': 'Another wallet operation is currently in progress. Please retry in a moment.'
+            }), 429
+
         if not request.is_json:
             return jsonify({'success': False, 'error': 'Content-Type must be application/json'}), 400
         
@@ -266,6 +289,12 @@ def process_payments():
     
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        if lock_acquired:
+            try:
+                _wallet_operation_lock.release()
+            except RuntimeError:
+                pass
 
 
 @admin_payments_bp.route('/payments/history', methods=['GET'])
@@ -281,6 +310,9 @@ def get_payment_history():
         end_date = request.args.get('end_date')
         limit = request.args.get('limit', type=int, default=20)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 50))
+        offset = max(0, offset)
         
         # Build query
         where_clause = "WHERE 1=1"
@@ -309,10 +341,13 @@ def get_payment_history():
                     et.id, et.amount, et.status, et.created_at, et.paid_at,
                     u.name as cleaner_name, u.email as cleaner_email,
                     t.description as task_description,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS before_image_url,
+                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS after_image_url,
                     admin_u.name as paid_by_name
                 FROM earnings_transactions et
                 JOIN users u ON et.cleaner_id = u.id
                 JOIN tasks t ON et.task_id = t.id
+                LEFT JOIN reports r ON t.report_id = r.id
                 LEFT JOIN users admin_u ON et.paid_by = admin_u.id
                 {where_clause}
                 ORDER BY et.created_at DESC
@@ -442,7 +477,15 @@ def get_payment_summary():
 @role_required('ADMIN')
 def top_up_system_funds():
     """Mock gateway endpoint to add money to system wallet."""
+    lock_acquired = False
     try:
+        lock_acquired = _wallet_operation_lock.acquire(blocking=False)
+        if not lock_acquired:
+            return jsonify({
+                'success': False,
+                'error': 'Another wallet operation is currently in progress. Please retry in a moment.'
+            }), 429
+
         if not request.is_json:
             return jsonify({'success': False, 'error': 'Content-Type must be application/json'}), 400
 
@@ -503,6 +546,12 @@ def top_up_system_funds():
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+    finally:
+        if lock_acquired:
+            try:
+                _wallet_operation_lock.release()
+            except RuntimeError:
+                pass
 
 
 @admin_payments_bp.route('/payments/funds/history', methods=['GET'])
@@ -513,6 +562,9 @@ def get_fund_transaction_history():
     try:
         limit = request.args.get('limit', type=int, default=50)
         offset = request.args.get('offset', type=int, default=0)
+
+        limit = max(1, min(limit, 100))
+        offset = max(0, offset)
 
         with db_connection.get_cursor() as cursor:
             _ensure_funding_tables(cursor)
