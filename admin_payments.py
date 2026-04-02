@@ -3,12 +3,15 @@ from auth import token_required, role_required
 from models import db_connection
 from decimal import Decimal
 from threading import Lock
+import time
 
 admin_payments_bp = Blueprint('admin_payments', __name__)
 
 _funding_tables_ready = False
 _funding_tables_lock = Lock()
 _wallet_operation_lock = Lock()
+_payment_summary_cache = {'expires_at': 0.0, 'payload': None}
+_payment_summary_cache_lock = Lock()
 
 
 def _ensure_funding_tables(cursor):
@@ -115,8 +118,8 @@ def get_pending_payments():
                     t.status as task_status,
                     r.id as report_id,
                     r.description as report_description,
-                    r.image_url as before_image_url,
-                    r.after_image_url as after_image_url,
+                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS before_image_url,
+                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS after_image_url,
                     r.latitude,
                     r.longitude,
                     cr.rating as review_rating,
@@ -171,6 +174,68 @@ def get_pending_payments():
             'data': transactions
         }), 200
     
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@admin_payments_bp.route('/payments/pending/<transaction_id>', methods=['GET'])
+@token_required
+@role_required('ADMIN')
+def get_pending_payment_details(transaction_id):
+    """Get full payout review details (including before/after images) for a single transaction."""
+    try:
+        with db_connection.get_cursor() as cursor:
+            _ensure_funding_tables(cursor)
+
+            cursor.execute("""
+                SELECT
+                    et.id, et.amount, et.created_at,
+                    et.cleaner_id, et.task_id,
+                    u.name as cleaner_name, u.email as cleaner_email,
+                    t.description as task_description, t.completed_at as task_completed_at,
+                    t.status as task_status,
+                    r.id as report_id,
+                    r.description as report_description,
+                    r.image_url as before_image_url,
+                    r.after_image_url as after_image_url,
+                    r.latitude,
+                    r.longitude,
+                    cr.rating as review_rating,
+                    cr.comment as review_comment,
+                    cr.created_at as review_created_at,
+                    ccp.completion_percentage,
+                    ccp.quality_rating,
+                    ccp.verification_status
+                FROM earnings_transactions et
+                JOIN users u ON et.cleaner_id = u.id
+                JOIN tasks t ON et.task_id = t.id
+                LEFT JOIN reports r ON t.report_id = r.id
+                LEFT JOIN cleanup_reviews cr ON r.id = cr.report_id
+                LEFT JOIN cleanup_comparisons ccp ON r.id = ccp.report_id
+                WHERE et.id = %s
+                  AND et.status = 'PENDING'
+                LIMIT 1
+            """, (transaction_id,))
+            transaction = cursor.fetchone()
+
+        if not transaction:
+            return jsonify({'success': False, 'error': 'Pending transaction not found'}), 404
+
+        transaction['amount'] = _amount_to_float(transaction['amount'])
+        transaction['created_at'] = transaction['created_at'].isoformat() if transaction.get('created_at') else None
+        transaction['task_completed_at'] = transaction['task_completed_at'].isoformat() if transaction.get('task_completed_at') else None
+        transaction['review_created_at'] = transaction['review_created_at'].isoformat() if transaction.get('review_created_at') else None
+
+        if transaction.get('latitude') is not None and transaction.get('longitude') is not None:
+            transaction['location'] = {
+                'lat': float(transaction['latitude']),
+                'lng': float(transaction['longitude'])
+            }
+        else:
+            transaction['location'] = None
+
+        return jsonify({'success': True, 'data': transaction}), 200
+
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -392,6 +457,11 @@ def get_payment_history():
 def get_payment_summary():
     """Get payout summary plus current system wallet status."""
     try:
+        now = time.time()
+        with _payment_summary_cache_lock:
+            if _payment_summary_cache['payload'] is not None and now < _payment_summary_cache['expires_at']:
+                return jsonify({'success': True, 'data': _payment_summary_cache['payload']}), 200
+
         with db_connection.get_cursor() as cursor:
             _ensure_funding_tables(cursor)
 
@@ -454,19 +524,22 @@ def get_payment_summary():
             cleaner['total_earnings'] = float(cleaner['total_earnings'])
             cleaner['avg_earning'] = float(cleaner['avg_earning'])
         
-        return jsonify({
-            'success': True,
-            'data': {
-                'overall': overall_stats,
-                'monthly': monthly_stats,
-                'top_cleaners': top_cleaners,
-                'wallet': {
-                    'current_balance': _amount_to_float(wallet['current_balance']) if wallet else 0,
-                    'total_added': _amount_to_float(wallet['total_added']) if wallet else 0,
-                    'total_paid': _amount_to_float(wallet['total_paid']) if wallet else 0,
-                }
+        payload = {
+            'overall': overall_stats,
+            'monthly': monthly_stats,
+            'top_cleaners': top_cleaners,
+            'wallet': {
+                'current_balance': _amount_to_float(wallet['current_balance']) if wallet else 0,
+                'total_added': _amount_to_float(wallet['total_added']) if wallet else 0,
+                'total_paid': _amount_to_float(wallet['total_paid']) if wallet else 0,
             }
-        }), 200
+        }
+
+        with _payment_summary_cache_lock:
+            _payment_summary_cache['payload'] = payload
+            _payment_summary_cache['expires_at'] = time.time() + 5.0
+
+        return jsonify({'success': True, 'data': payload}), 200
     
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
