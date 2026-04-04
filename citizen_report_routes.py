@@ -1,9 +1,54 @@
 from flask import jsonify, request
+import os
+import time
 
 from auth import token_required, role_required
 from models import db_connection
 
 from citizen_blueprint import citizen_bp
+
+
+_citizen_report_details_cache = {}
+
+
+def _citizen_report_details_ttl_seconds() -> int:
+    try:
+        return max(0, int(os.getenv('CITIZEN_REPORT_DETAILS_CACHE_TTL', '30')))
+    except Exception:
+        return 30
+
+
+def _report_cache_key(user_id: str, report_id: str) -> str:
+    return f"{user_id}:{report_id}"
+
+
+def _get_cached_report_details(user_id: str, report_id: str):
+    entry = _citizen_report_details_cache.get(_report_cache_key(user_id, report_id))
+    if not entry:
+        return None
+    if time.time() >= entry['expires_at']:
+        _citizen_report_details_cache.pop(_report_cache_key(user_id, report_id), None)
+        return None
+    return entry['payload']
+
+
+def _set_cached_report_details(user_id: str, report_id: str, payload):
+    ttl = _citizen_report_details_ttl_seconds()
+    if ttl <= 0:
+        return
+    _citizen_report_details_cache[_report_cache_key(user_id, report_id)] = {
+        'expires_at': time.time() + ttl,
+        'payload': payload,
+    }
+
+
+def _invalidate_cached_report_details(report_id: str, user_id: str = None):
+    if user_id:
+        _citizen_report_details_cache.pop(_report_cache_key(user_id, report_id), None)
+        return
+    for key in list(_citizen_report_details_cache.keys()):
+        if key.endswith(f":{report_id}"):
+            _citizen_report_details_cache.pop(key, None)
 
 
 def _to_int_percentage(value, default=0):
@@ -189,8 +234,16 @@ def get_my_reports():
                     r.description,
                     r.severity,
                     r.status,
-                    CASE WHEN r.image_url LIKE 'data:%%' THEN NULL ELSE r.image_url END AS image_url,
-                    CASE WHEN r.after_image_url LIKE 'data:%%' THEN NULL ELSE r.after_image_url END AS after_image_url,
+                    CASE
+                        WHEN r.status = 'COMPLETED' THEN r.image_url
+                        WHEN r.image_url LIKE 'data:%%' THEN NULL
+                        ELSE r.image_url
+                    END AS image_url,
+                    CASE
+                        WHEN r.status = 'COMPLETED' THEN r.after_image_url
+                        WHEN r.after_image_url LIKE 'data:%%' THEN NULL
+                        ELSE r.after_image_url
+                    END AS after_image_url,
                     r.created_at,
                     r.completed_at,
                     z.name as zone_name,
@@ -235,6 +288,10 @@ def get_report_details(report_id):
     """Get detailed information about a specific report"""
     try:
         user_id = request.current_user['id']
+
+        cached_payload = _get_cached_report_details(user_id, report_id)
+        if cached_payload is not None:
+            return jsonify({'success': True, 'data': cached_payload}), 200
         
         with db_connection.get_cursor() as cursor:
             # Get report with all related data
@@ -252,7 +309,31 @@ def get_report_details(report_id):
                     cc.quality_rating, cc.environmental_benefit, cc.verification_status,
                     cc.feedback, cc.confidence as comparison_confidence,
                     cr.rating as citizen_rating, cr.comment as citizen_comment,
-                    cr.created_at as citizen_reviewed_at
+                    cr.created_at as citizen_reviewed_at,
+                    (
+                        SELECT COALESCE(
+                            json_agg(
+                                json_build_object(
+                                    'waste_type', wc.waste_type,
+                                    'percentage', wc.percentage,
+                                    'recyclable', wc.recyclable
+                                )
+                            ),
+                            '[]'::json
+                        )
+                        FROM waste_compositions wc
+                        JOIN waste_analyses wa2 ON wc.waste_analysis_id = wa2.id
+                        WHERE wa2.report_id = r.id
+                    ) as waste_composition,
+                    (
+                        SELECT COALESCE(
+                            json_agg(se.equipment_name),
+                            '[]'::json
+                        )
+                        FROM special_equipment se
+                        JOIN waste_analyses wa3 ON se.waste_analysis_id = wa3.id
+                        WHERE wa3.report_id = r.id
+                    ) as special_equipment_needed
                 FROM reports r
                 JOIN zones z ON r.zone_id = z.id
                 LEFT JOIN users u ON r.cleaner_id = u.id
@@ -266,27 +347,9 @@ def get_report_details(report_id):
             
             if not report:
                 return jsonify({'success': False, 'error': 'Report not found'}), 404
-            
-            # Get waste composition if available
-            waste_composition = []
-            special_equipment = []
-            if report.get('ai_description'):
-                cursor.execute("""
-                    SELECT waste_type, percentage, recyclable
-                    FROM waste_compositions wc
-                    JOIN waste_analyses wa ON wc.waste_analysis_id = wa.id
-                    WHERE wa.report_id = %s
-                """, (report_id,))
-                waste_composition = cursor.fetchall()
 
-                cursor.execute("""
-                    SELECT equipment_name
-                    FROM special_equipment se
-                    JOIN waste_analyses wa ON se.waste_analysis_id = wa.id
-                    WHERE wa.report_id = %s
-                """, (report_id,))
-                special_equipment_rows = cursor.fetchall()
-                special_equipment = [row['equipment_name'] for row in special_equipment_rows]
+        waste_composition = report.get('waste_composition') or []
+        special_equipment = report.get('special_equipment_needed') or []
         
         # Structure the response
         response_data = {
@@ -350,10 +413,8 @@ def get_report_details(report_id):
                 'reviewed_at': report['citizen_reviewed_at'].isoformat() if report.get('citizen_reviewed_at') else None,
             }
         
-        return jsonify({
-            'success': True,
-            'data': response_data
-        }), 200
+        _set_cached_report_details(user_id, report_id, response_data)
+        return jsonify({'success': True, 'data': response_data}), 200
     
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -418,6 +479,8 @@ def update_report(report_id):
                 RETURNING id, zone_id, description, severity, status, image_url, latitude, longitude, created_at, updated_at
             """, [*list(updates.values()), user_id, report_id, user_id])
             updated_report = cursor.fetchone()
+
+        _invalidate_cached_report_details(report_id, user_id)
 
         return jsonify({
             'success': True,
@@ -497,6 +560,8 @@ def delete_report(report_id):
                 WHERE id = %s AND user_id = %s
             """, (report_id, user_id))
 
+        _invalidate_cached_report_details(report_id, user_id)
+
         return jsonify({
             'success': True,
             'message': 'Report deleted successfully',
@@ -556,6 +621,8 @@ def submit_cleanup_review(report_id):
             """, ())
             points_result = cursor.fetchone()
             points_earned = points_result['green_points'] if points_result else 0
+
+        _invalidate_cached_report_details(report_id, user_id)
         
         return jsonify({
             'success': True,
