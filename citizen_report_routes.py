@@ -16,6 +16,23 @@ def _to_int_percentage(value, default=0):
     except Exception:
         return default
 
+
+def _normalize_confidence(value, default=0):
+    """Accept confidence as 0-1 decimal, 0-100 numeric, or percent string."""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.strip().rstrip('%')
+            if value == '':
+                return default
+        parsed = float(value)
+        if 0 <= parsed <= 1:
+            parsed *= 100
+        return max(0, min(100, int(round(parsed))))
+    except Exception:
+        return default
+
 @citizen_bp.route('/reports', methods=['POST'])
 @token_required
 @role_required('CITIZEN')
@@ -70,12 +87,7 @@ def submit_report():
                 if ai_impact not in valid_impacts:
                     ai_impact = 'MODERATE'
 
-                ai_confidence = ai_analysis.get('confidence', 0)
-                try:
-                    ai_confidence = int(ai_confidence)
-                except Exception:
-                    ai_confidence = 0
-                ai_confidence = max(0, min(100, ai_confidence))
+                ai_confidence = _normalize_confidence(ai_analysis.get('confidence', 0), default=0)
 
                 cursor.execute("""
                     INSERT INTO waste_analyses

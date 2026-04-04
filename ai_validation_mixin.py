@@ -6,6 +6,28 @@ from typing import Any, Dict, List
 
 class AIServiceValidationMixin:
 
+    def _normalize_confidence(self, raw_value: Any, default: int = 80) -> int:
+        """Normalize confidence from either 0-1 or 0-100 formats into 0-100 int."""
+        try:
+            if raw_value is None:
+                return default
+
+            if isinstance(raw_value, str):
+                cleaned = raw_value.strip().rstrip('%')
+                if cleaned == '':
+                    return default
+                value = float(cleaned)
+            else:
+                value = float(raw_value)
+
+            # Many model responses return confidence as 0-1 decimal.
+            if 0 <= value <= 1:
+                value *= 100
+
+            return max(0, min(100, int(round(value))))
+        except Exception:
+            return default
+
     def _validate_analysis_response(self, data: Dict[str, Any]) -> Dict[str, Any]:
         defaults = {
             "description": "Waste materials detected",
@@ -31,7 +53,7 @@ class AIServiceValidationMixin:
         if data["environmentalImpact"] not in ["LOW", "MODERATE", "HIGH", "SEVERE"]:
             data["environmentalImpact"] = "MODERATE"
 
-        data["confidence"] = max(0, min(100, int(data.get("confidence", 80))))
+        data["confidence"] = self._normalize_confidence(data.get("confidence", 80), default=80)
 
         # Normalize composition percentages.
         composition = data.get("wasteComposition") or []
@@ -95,7 +117,7 @@ class AIServiceValidationMixin:
             data["verificationStatus"] = "VERIFIED"
 
         data["completionPercentage"] = max(0, min(100, int(data.get("completionPercentage", 80))))
-        data["confidence"] = max(0, min(100, int(data.get("confidence", 80))))
+        data["confidence"] = self._normalize_confidence(data.get("confidence", 80), default=80)
 
         if not isinstance(data.get("wasteRemoved"), list) or not data["wasteRemoved"]:
             data["wasteRemoved"] = [{"type": "Mixed", "percentage": 100, "recyclable": False}]
