@@ -419,6 +419,8 @@ def get_task_details(task_id):
                     r.image_url as report_image, r.after_image_url,
                     u.name as reporter_name,
                     wa.estimated_volume, wa.environmental_impact, wa.recommended_action,
+                    wa.estimated_cleanup_time, wa.health_hazard, wa.hazard_details,
+                    wa.confidence as ai_confidence,
                     cr.rating as review_rating, cr.comment as review_comment, cr.created_at as review_date,
                     et.amount as earnings_amount, et.status as earnings_status, et.paid_at
                 FROM tasks t
@@ -437,7 +439,25 @@ def get_task_details(task_id):
             
             # Get special equipment if available
             special_equipment = []
+            waste_composition = []
             if task['report_id']:
+                cursor.execute("""
+                    SELECT wc.waste_type, wc.percentage, wc.recyclable
+                    FROM waste_compositions wc
+                    JOIN waste_analyses wa ON wc.waste_analysis_id = wa.id
+                    WHERE wa.report_id = %s
+                    ORDER BY wc.percentage DESC
+                """, (task['report_id'],))
+                waste_rows = cursor.fetchall() or []
+                waste_composition = [
+                    {
+                        'waste_type': row['waste_type'],
+                        'percentage': row['percentage'],
+                        'recyclable': row['recyclable'],
+                    }
+                    for row in waste_rows
+                ]
+
                 cursor.execute("""
                     SELECT se.equipment_name
                     FROM special_equipment se
@@ -474,12 +494,28 @@ def get_task_details(task_id):
                 'after_image_url': task['after_image_url'],
                 'reporter_name': task['reporter_name']
             }
-            
-            if task['estimated_volume']:
+
+            has_ai_data = any([
+                task.get('estimated_volume'),
+                task.get('environmental_impact'),
+                task.get('recommended_action'),
+                task.get('estimated_cleanup_time'),
+                task.get('hazard_details'),
+                task.get('ai_confidence') is not None,
+                bool(waste_composition),
+                bool(special_equipment),
+            ])
+
+            if has_ai_data:
                 response_data['ai_analysis'] = {
                     'estimated_volume': task['estimated_volume'],
                     'environmental_impact': task['environmental_impact'],
+                    'health_hazard': bool(task.get('health_hazard')),
+                    'hazard_details': task.get('hazard_details'),
                     'recommended_action': task['recommended_action'],
+                    'estimated_cleanup_time': task.get('estimated_cleanup_time'),
+                    'confidence': float(task.get('ai_confidence') or 0),
+                    'waste_composition': waste_composition,
                     'special_equipment': special_equipment
                 }
         
