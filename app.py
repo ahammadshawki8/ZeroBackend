@@ -226,6 +226,7 @@ def home():
                 "GET /api/citizen/profile": "Get citizen profile",
                 "PUT /api/citizen/profile": "Update citizen profile",
                 "GET /api/citizen/stats": "Get citizen statistics",
+                "POST /api/admin/debug/pool-reset": "Emergency superadmin pool reset",
                 "POST /api/citizen/reports": "Submit waste report",
                 "GET /api/citizen/reports": "Get my reports",
                 "GET /api/citizen/reports/<id>": "Get report details",

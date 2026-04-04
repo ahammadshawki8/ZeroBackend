@@ -2,7 +2,7 @@ from flask import jsonify, request
 import os
 import time
 
-from auth import token_required, role_required
+from auth import token_required, role_required, superadmin_required
 from models import db_connection
 
 from admin_blueprint import admin_bp
@@ -320,6 +320,35 @@ def get_pool_health():
                 'active_queries': active_queries,
             }
         }), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@admin_bp.route('/debug/pool-reset', methods=['POST'])
+@token_required
+@superadmin_required
+def force_reset_pool():
+    """Emergency endpoint to drop and recreate DB pool during contention spikes."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        confirmation = str(payload.get('confirm') or '').strip().upper()
+        if confirmation != 'RESET_DB_POOL':
+            return jsonify({
+                'success': False,
+                'error': 'Confirmation required. Pass {"confirm": "RESET_DB_POOL"}.'
+            }), 400
+
+        terminate_sessions = bool(payload.get('terminate_sessions', False))
+        terminate_only_current_user = bool(payload.get('terminate_only_current_user', True))
+
+        result = db_connection.force_reset_pool(
+            terminate_sessions=terminate_sessions,
+            terminate_only_current_user=terminate_only_current_user,
+        )
+
+        status_code = 200 if result.get('pool_recreated') else 503
+        return jsonify({'success': bool(result.get('pool_recreated')), 'data': result}), status_code
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

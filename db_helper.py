@@ -319,6 +319,119 @@ class DatabaseConnection:
                 self.connection_pool.closeall()
             print("Connection pool closed")
 
+    def _get_pool_stats_safe(self) -> Dict[str, Any]:
+        """Read pool stats defensively so debug endpoints never crash on stats fetch."""
+        pool = self.connection_pool
+        if pool is None or not hasattr(pool, 'get_stats'):
+            return {}
+        try:
+            return pool.get_stats() or {}
+        except Exception as stats_error:
+            return {'stats_error': str(stats_error)}
+
+    def _terminate_server_sessions(self, terminate_only_current_user: bool = True) -> Dict[str, Any]:
+        """Terminate backend sessions in current database using a direct maintenance connection."""
+        ssl_mode = os.getenv('DB_SSLMODE', 'require')
+        connect_timeout = int(os.getenv('DB_CONNECT_TIMEOUT', '10'))
+
+        conn = None
+        cursor = None
+        try:
+            if PSYCOPG_VERSION == 3:
+                conninfo = (
+                    f"host={self.config.host} "
+                    f"port={self.config.port} "
+                    f"dbname={self.config.database} "
+                    f"user={self.config.user} "
+                    f"password={self.config.password} "
+                    f"sslmode={ssl_mode} "
+                    f"connect_timeout={connect_timeout}"
+                )
+                conn = psycopg.connect(conninfo, autocommit=True)
+                cursor = conn.cursor(row_factory=dict_row)
+            else:
+                conn = psycopg2.connect(
+                    host=self.config.host,
+                    port=self.config.port,
+                    database=self.config.database,
+                    user=self.config.user,
+                    password=self.config.password,
+                    sslmode=ssl_mode,
+                    connect_timeout=connect_timeout,
+                )
+                conn.autocommit = True
+                cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+            query = """
+                SELECT pid
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+            """
+            if terminate_only_current_user:
+                query += " AND usename = current_user"
+
+            cursor.execute(query)
+            rows = cursor.fetchall() or []
+            pids = [row.get('pid') for row in rows if row.get('pid')]
+
+            terminated = 0
+            for pid in pids:
+                cursor.execute("SELECT pg_terminate_backend(%s) AS terminated", (pid,))
+                result = cursor.fetchone() or {}
+                if bool(result.get('terminated')):
+                    terminated += 1
+
+            return {
+                'requested_terminations': len(pids),
+                'terminated_sessions': terminated,
+                'terminate_only_current_user': terminate_only_current_user,
+            }
+        except Exception as e:
+            return {
+                'requested_terminations': 0,
+                'terminated_sessions': 0,
+                'terminate_only_current_user': terminate_only_current_user,
+                'termination_error': str(e),
+            }
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    def force_reset_pool(self, terminate_sessions: bool = False, terminate_only_current_user: bool = True) -> Dict[str, Any]:
+        """Force-close the local pool and recreate it; optionally terminate DB sessions first."""
+        with self._pool_reset_lock:
+            before_stats = self._get_pool_stats_safe()
+            self._close_pool_safely()
+
+            termination_result: Dict[str, Any] = {
+                'requested_terminations': 0,
+                'terminated_sessions': 0,
+                'terminate_only_current_user': terminate_only_current_user,
+            }
+            if terminate_sessions:
+                termination_result = self._terminate_server_sessions(
+                    terminate_only_current_user=terminate_only_current_user
+                )
+
+            recreated = self.create_pool()
+            after_stats = self._get_pool_stats_safe() if recreated else {}
+
+            return {
+                'pool_recreated': bool(recreated),
+                'before_pool_stats': before_stats,
+                'after_pool_stats': after_stats,
+                'termination': termination_result,
+            }
+
 class QueryBuilder:
     """Provides helper methods to build parameterized SQL queries."""
 
