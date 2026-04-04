@@ -20,6 +20,8 @@ services:
         value: false
       - key: AUTH_USER_CACHE_TTL
         value: 120
+      - key: AUTH_USE_JWT_CLAIMS_ONLY
+        value: true
       - key: AUTO_SETUP_DATABASE_ON_START
         value: true
       - key: DB_BOOTSTRAP_RETRIES
@@ -45,7 +47,7 @@ services:
       - key: DB_POOL_MAX_LIFETIME
         value: 300
       - key: DB_POOL_TIMEOUT
-        value: 30
+        value: 8
       - key: DB_QUERY_RETRIES
         value: 2
       - key: DB_QUERY_RETRY_DELAY

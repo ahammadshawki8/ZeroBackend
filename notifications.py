@@ -78,27 +78,44 @@ def get_notifications():
             params.append(notification_type)
         
         with db_connection.get_cursor() as cursor:
-            # Get notifications
             cursor.execute(f"""
-                SELECT 
-                    n.id, n.type, n.title, n.message, n.is_read, 
-                    n.related_report_id, n.related_task_id, n.created_at
-                FROM notifications n
-                {where_clause}
-                ORDER BY n.created_at DESC
+                WITH filtered AS (
+                    SELECT
+                        n.id,
+                        n.type,
+                        n.title,
+                        n.message,
+                        n.is_read,
+                        n.related_report_id,
+                        n.related_task_id,
+                        n.created_at
+                    FROM notifications n
+                    {where_clause}
+                )
+                SELECT
+                    id,
+                    type,
+                    title,
+                    message,
+                    is_read,
+                    related_report_id,
+                    related_task_id,
+                    created_at,
+                    COUNT(*) OVER() AS total_count,
+                    COUNT(*) FILTER (WHERE is_read = false) OVER() AS unread_count
+                FROM filtered
+                ORDER BY created_at DESC
                 LIMIT %s OFFSET %s
             """, params + [limit, offset])
             notifications = cursor.fetchall()
-            
-            # Get unread count and total
-            cursor.execute(f"""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN is_read = false THEN 1 END) as unread_count
-                FROM notifications n
-                WHERE n.user_id = %s {type_clause}
-            """, [user_id])
-            counts = cursor.fetchone()
+
+        counts = {
+            'total': notifications[0]['total_count'] if notifications else 0,
+            'unread_count': notifications[0]['unread_count'] if notifications else 0,
+        }
+        for notification in notifications:
+            notification.pop('total_count', None)
+            notification.pop('unread_count', None)
         
         # Convert timestamps to explicit UTC ISO strings so the client does not
         # misread naive database timestamps as local time.

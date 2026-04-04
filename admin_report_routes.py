@@ -40,7 +40,8 @@ def get_all_reports():
                    r.completed_at,
                    u.name as user_name,
                    z.name as zone_name,
-                   cu.name as cleaner_name
+                     cu.name as cleaner_name,
+                     COUNT(*) OVER() AS total_count
             FROM reports r
             LEFT JOIN users u ON r.user_id = u.id
             LEFT JOIN zones z ON r.zone_id = z.id
@@ -69,24 +70,10 @@ def get_all_reports():
         with db_connection.get_cursor() as cursor:
             cursor.execute(query, params)
             reports = cursor.fetchall()
-        
-        # Get total count
-        count_query = "SELECT COUNT(*) as total FROM reports WHERE 1=1"
-        count_params = []
-        if status:
-            count_query += " AND status = %s"
-            count_params.append(status)
-        if severity:
-            count_query += " AND severity = %s"
-            count_params.append(severity)
-        if zone_id:
-            count_query += " AND zone_id = %s"
-            count_params.append(zone_id)
-        
-        with db_connection.get_cursor() as cursor:
-            cursor.execute(count_query, count_params if count_params else None)
-            count_result = cursor.fetchone()
-            total = count_result['total'] if count_result else 0
+
+        total = reports[0]['total_count'] if reports else 0
+        for report in reports:
+            report.pop('total_count', None)
         
         return jsonify({
             'success': True,

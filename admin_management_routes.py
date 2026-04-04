@@ -1,9 +1,24 @@
 from flask import jsonify, request
+import os
+import time
 
 from auth import token_required, role_required
 from models import db_connection
 
 from admin_blueprint import admin_bp
+
+
+_dashboard_summary_cache = {
+    'expires_at': 0.0,
+    'data': None,
+}
+
+
+def _dashboard_cache_ttl_seconds() -> int:
+    try:
+        return max(0, int(os.getenv('ADMIN_DASHBOARD_CACHE_TTL', '30')))
+    except Exception:
+        return 30
 
 @admin_bp.route('/users', methods=['GET'])
 @token_required
@@ -164,6 +179,11 @@ def get_system_stats():
 def get_dashboard_summary():
     """Get lightweight dashboard aggregates for fast first paint."""
     try:
+        now = time.time()
+        ttl = _dashboard_cache_ttl_seconds()
+        if ttl > 0 and _dashboard_summary_cache['data'] is not None and now < _dashboard_summary_cache['expires_at']:
+            return jsonify({'success': True, 'data': _dashboard_summary_cache['data']}), 200
+
         with db_connection.get_cursor() as cursor:
             cursor.execute("""
                 SELECT
@@ -227,15 +247,18 @@ def get_dashboard_summary():
             """)
             pending_reports = cursor.fetchall() or []
 
-        return jsonify({
-            'success': True,
-            'data': {
-                'report_stats': report_stats,
-                'task_stats': task_stats,
-                'reports_by_zone': reports_by_zone,
-                'pending_reports': pending_reports,
-            }
-        }), 200
+        payload = {
+            'report_stats': report_stats,
+            'task_stats': task_stats,
+            'reports_by_zone': reports_by_zone,
+            'pending_reports': pending_reports,
+        }
+
+        if ttl > 0:
+            _dashboard_summary_cache['data'] = payload
+            _dashboard_summary_cache['expires_at'] = now + ttl
+
+        return jsonify({'success': True, 'data': payload}), 200
 
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

@@ -67,11 +67,12 @@ def get_available_tasks():
             total_result = cursor.fetchone()
             total = total_result['total'] if total_result else 0
 
-            report_ids = [task['report_id'] for task in tasks if task.get('report_id')]
-            waste_by_report = {}
-            equipment_by_report = {}
+        report_ids = [task['report_id'] for task in tasks if task.get('report_id')]
+        waste_by_report = {}
+        equipment_by_report = {}
 
-            if report_ids:
+        if report_ids:
+            with db_connection.get_cursor() as cursor:
                 cursor.execute("""
                     SELECT
                         wa.report_id,
@@ -83,12 +84,7 @@ def get_available_tasks():
                     WHERE wa.report_id = ANY(%s)
                     ORDER BY wa.report_id
                 """, (report_ids,))
-                for row in cursor.fetchall():
-                    waste_by_report.setdefault(row['report_id'], []).append({
-                        'waste_type': row['waste_type'],
-                        'percentage': row['percentage'],
-                        'recyclable': row['recyclable'],
-                    })
+                waste_rows = cursor.fetchall()
 
                 cursor.execute("""
                     SELECT
@@ -99,13 +95,22 @@ def get_available_tasks():
                     WHERE wa.report_id = ANY(%s)
                     ORDER BY wa.report_id
                 """, (report_ids,))
-                for row in cursor.fetchall():
-                    equipment_by_report.setdefault(row['report_id'], []).append(row['equipment_name'])
+                equipment_rows = cursor.fetchall()
 
-            for task in tasks:
-                report_id = task.get('report_id')
-                task['waste_composition'] = waste_by_report.get(report_id, []) if report_id else []
-                task['special_equipment'] = equipment_by_report.get(report_id, []) if report_id else []
+            for row in waste_rows:
+                waste_by_report.setdefault(row['report_id'], []).append({
+                    'waste_type': row['waste_type'],
+                    'percentage': row['percentage'],
+                    'recyclable': row['recyclable'],
+                })
+
+            for row in equipment_rows:
+                equipment_by_report.setdefault(row['report_id'], []).append(row['equipment_name'])
+
+        for task in tasks:
+            report_id = task.get('report_id')
+            task['waste_composition'] = waste_by_report.get(report_id, []) if report_id else []
+            task['special_equipment'] = equipment_by_report.get(report_id, []) if report_id else []
         
         # Convert timestamps to ISO format
         for task in tasks:

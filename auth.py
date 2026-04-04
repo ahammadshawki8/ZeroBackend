@@ -15,6 +15,10 @@ _auth_user_cache = {}
 _auth_user_cache_lock = Lock()
 
 
+def _to_bool(value: str) -> bool:
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def _cache_ttl_seconds() -> int:
     """Return cache TTL for auth user snapshots."""
     try:
@@ -67,6 +71,11 @@ def _get_secret_key() -> str:
     return secret_key
 
 
+def _jwt_claims_only_enabled() -> bool:
+    """When enabled, trust JWT claims for request identity to avoid per-request DB lookups."""
+    return _to_bool(os.getenv('AUTH_USE_JWT_CLAIMS_ONLY', 'true'))
+
+
 def token_required(f):
     """Decorator to protect routes with JWT authentication"""
     @wraps(f)
@@ -97,14 +106,31 @@ def token_required(f):
             if not user_id:
                 return jsonify({'success': False, 'error': 'Invalid token payload'}), 401
 
-            current_user = _get_cached_user(user_id)
-            if not current_user:
-                current_user = users_model.find_by_id(user_id)
-                if current_user:
-                    _set_cached_user(user_id, current_user)
+            if _jwt_claims_only_enabled():
+                # Fast path: no DB query in auth middleware.
+                current_user = {
+                    'id': user_id,
+                    'email': data.get('email'),
+                    'role': data.get('role'),
+                    'name': data.get('name'),
+                    'is_active': data.get('is_active', True),
+                    'is_superadmin': data.get('is_superadmin', False),
+                }
+            else:
+                current_user = _get_cached_user(user_id)
+                if not current_user:
+                    current_user = users_model.find_by_id(user_id)
+                    if current_user:
+                        _set_cached_user(user_id, current_user)
             
             if not current_user:
                 return jsonify({'success': False, 'error': 'User not found'}), 401
+
+            if not current_user.get('role'):
+                return jsonify({'success': False, 'error': 'Invalid token payload'}), 401
+
+            if current_user.get('is_active') is False:
+                return jsonify({'success': False, 'error': 'Account is deactivated'}), 401
             
             # Add user to request context
             request.current_user = current_user

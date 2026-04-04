@@ -132,6 +132,88 @@ def get_all_tasks():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@admin_tasks_bp.route('/tasks/<task_id>', methods=['GET'])
+@token_required
+@role_required('ADMIN')
+def get_task_details(task_id):
+    """Get full details for a single task (includes full image URLs)."""
+    try:
+        with db_connection.get_cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    t.id, t.report_id, t.zone_id, t.cleaner_id,
+                    t.description, t.priority, t.status, t.reward,
+                    t.due_date, t.created_at, t.taken_at, t.completed_at,
+                    t.evidence_image_url,
+                    z.name as zone_name,
+                    c.name as cleaner_name,
+                    r.image_url as before_image_url,
+                    r.after_image_url as report_after_image_url,
+                    wa.description as ai_description,
+                    wa.severity as ai_severity,
+                    wa.estimated_volume,
+                    wa.environmental_impact,
+                    wa.health_hazard,
+                    wa.hazard_details,
+                    wa.recommended_action,
+                    wa.estimated_cleanup_time,
+                    wa.confidence as ai_confidence,
+                    (
+                        SELECT COALESCE(
+                            json_agg(
+                                json_build_object(
+                                    'waste_type', wc.waste_type,
+                                    'percentage', wc.percentage,
+                                    'recyclable', wc.recyclable
+                                )
+                            ),
+                            '[]'::json
+                        )
+                        FROM waste_compositions wc
+                        WHERE wa.id IS NOT NULL AND wc.waste_analysis_id = wa.id
+                    ) as waste_composition,
+                    (
+                        SELECT COALESCE(
+                            json_agg(se.equipment_name),
+                            '[]'::json
+                        )
+                        FROM special_equipment se
+                        WHERE wa.id IS NOT NULL AND se.waste_analysis_id = wa.id
+                    ) as special_equipment_needed,
+                    cc.completion_percentage,
+                    cc.before_summary,
+                    cc.after_summary,
+                    cc.quality_rating,
+                    cc.environmental_benefit,
+                    cc.verification_status,
+                    cc.feedback,
+                    cc.confidence as comparison_confidence
+                FROM tasks t
+                JOIN zones z ON t.zone_id = z.id
+                LEFT JOIN users c ON t.cleaner_id = c.id
+                LEFT JOIN reports r ON t.report_id = r.id
+                LEFT JOIN waste_analyses wa ON r.id = wa.report_id
+                LEFT JOIN cleanup_comparisons cc ON r.id = cc.report_id
+                WHERE t.id = %s
+                LIMIT 1
+            """, (task_id,))
+            task = cursor.fetchone()
+
+        if not task:
+            return jsonify({'success': False, 'error': 'Task not found'}), 404
+
+        task['reward'] = float(task['reward'])
+        task['due_date'] = task['due_date'].isoformat() if task.get('due_date') else None
+        task['created_at'] = task['created_at'].isoformat() if task.get('created_at') else None
+        task['taken_at'] = task['taken_at'].isoformat() if task.get('taken_at') else None
+        task['completed_at'] = task['completed_at'].isoformat() if task.get('completed_at') else None
+
+        return jsonify({'success': True, 'data': task}), 200
+
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @admin_tasks_bp.route('/tasks', methods=['POST'])
 @token_required
 @role_required('ADMIN')

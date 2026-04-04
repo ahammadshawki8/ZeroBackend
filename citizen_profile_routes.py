@@ -1,10 +1,42 @@
 from flask import jsonify, request
 from datetime import datetime
+import os
+import time
 
 from auth import token_required, role_required
 from models import db_connection
 
 from citizen_blueprint import citizen_bp
+
+
+_citizen_rank_cache = {}
+
+
+def _rank_cache_ttl_seconds() -> int:
+    try:
+        return max(0, int(os.getenv('CITIZEN_PROFILE_RANK_CACHE_TTL', '45')))
+    except Exception:
+        return 45
+
+
+def _get_cached_rank(user_id):
+    entry = _citizen_rank_cache.get(user_id)
+    if not entry:
+        return None
+    if time.time() >= entry['expires_at']:
+        _citizen_rank_cache.pop(user_id, None)
+        return None
+    return entry['rank']
+
+
+def _set_cached_rank(user_id, rank):
+    ttl = _rank_cache_ttl_seconds()
+    if ttl <= 0:
+        return
+    _citizen_rank_cache[user_id] = {
+        'rank': rank,
+        'expires_at': time.time() + ttl,
+    }
 
 @citizen_bp.route('/profile', methods=['GET'])
 @token_required
@@ -55,24 +87,28 @@ def get_profile():
                 if badge['earned_at']:
                     badge['earned_at'] = badge['earned_at'].isoformat()
 
-            # Compute live rank from current points to avoid stale leaderboard rank fields.
-            cursor.execute("""
-                SELECT ranked.rank
-                FROM (
-                    SELECT cp.user_id,
-                           ROW_NUMBER() OVER (
-                               ORDER BY cp.green_points_balance DESC,
-                                        cp.approved_reports DESC,
-                                        cp.total_reports DESC
-                           ) AS rank
-                    FROM citizen_profiles cp
-                    JOIN users u ON u.id = cp.user_id
-                    WHERE u.is_active = true
-                ) ranked
-                WHERE ranked.user_id = %s
-            """, (user['id'],))
-            rank_result = cursor.fetchone()
-            live_rank = rank_result['rank'] if rank_result else None
+        # Compute live rank in a separate short read and cache briefly to avoid repeated heavy scans.
+        live_rank = _get_cached_rank(user['id'])
+        if live_rank is None:
+            with db_connection.get_cursor() as cursor:
+                cursor.execute("""
+                    SELECT ranked.rank
+                    FROM (
+                        SELECT cp.user_id,
+                               ROW_NUMBER() OVER (
+                                   ORDER BY cp.green_points_balance DESC,
+                                            cp.approved_reports DESC,
+                                            cp.total_reports DESC
+                               ) AS rank
+                        FROM citizen_profiles cp
+                        JOIN users u ON u.id = cp.user_id
+                        WHERE u.is_active = true
+                    ) ranked
+                    WHERE ranked.user_id = %s
+                """, (user['id'],))
+                rank_result = cursor.fetchone()
+                live_rank = rank_result['rank'] if rank_result else None
+                _set_cached_rank(user['id'], live_rank)
         
         # Flatten the response to match frontend expectations
         flattened_profile = {

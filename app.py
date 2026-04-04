@@ -442,7 +442,10 @@ def login():
             token = jwt.encode({
                 'user_id': user['id'],
                 'email': user['email'],
-                'role': user['role']
+                'role': user['role'],
+                'name': user.get('name'),
+                'is_active': user.get('is_active', True),
+                'is_superadmin': user.get('is_superadmin', False),
             }, app.config['SECRET_KEY'], algorithm="HS256")
             
             # Remove password hash from response

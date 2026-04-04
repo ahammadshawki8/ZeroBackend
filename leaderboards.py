@@ -2,8 +2,40 @@ from flask import Blueprint, jsonify, request
 from auth import token_required, role_required
 from models import db_connection
 from datetime import datetime
+import os
+import time
 
 leaderboards_bp = Blueprint('leaderboards', __name__)
+
+
+_leaderboard_cache = {}
+
+
+def _leaderboard_cache_ttl_seconds() -> int:
+    try:
+        return max(0, int(os.getenv('LEADERBOARD_CACHE_TTL', '45')))
+    except Exception:
+        return 45
+
+
+def _read_cached_leaderboard(cache_key):
+    entry = _leaderboard_cache.get(cache_key)
+    if not entry:
+        return None
+    if time.time() >= entry['expires_at']:
+        _leaderboard_cache.pop(cache_key, None)
+        return None
+    return entry['value']
+
+
+def _store_cached_leaderboard(cache_key, value):
+    ttl = _leaderboard_cache_ttl_seconds()
+    if ttl <= 0:
+        return
+    _leaderboard_cache[cache_key] = {
+        'expires_at': time.time() + ttl,
+        'value': value,
+    }
 
 
 @leaderboards_bp.route('/leaderboards/citizens', methods=['GET'])
@@ -24,6 +56,11 @@ def get_citizen_leaderboard():
             limit = 10
         if limit > 100:
             limit = 100
+
+        cache_key = ('citizens', period, limit)
+        cached_payload = _read_cached_leaderboard(cache_key)
+        if cached_payload is not None:
+            return jsonify({'success': True, 'period': period, 'data': cached_payload}), 200
 
         date_filter_sql = ""
         if period == 'month':
@@ -76,6 +113,8 @@ def get_citizen_leaderboard():
                 LIMIT %s
             """, (limit,))
             leaderboard = cursor.fetchall()
+
+        _store_cached_leaderboard(cache_key, leaderboard)
         
         return jsonify({
             'success': True,
@@ -105,6 +144,11 @@ def get_cleaner_leaderboard():
             limit = 10
         if limit > 100:
             limit = 100
+
+        cache_key = ('cleaners', period, limit)
+        cached_payload = _read_cached_leaderboard(cache_key)
+        if cached_payload is not None:
+            return jsonify({'success': True, 'period': period, 'data': cached_payload}), 200
 
         date_filter_sql = ""
         if period == 'month':
@@ -158,6 +202,8 @@ def get_cleaner_leaderboard():
         for entry in leaderboard:
             entry['total_earnings'] = float(entry['total_earnings'])
             entry['rating'] = float(entry['rating'])
+
+        _store_cached_leaderboard(cache_key, leaderboard)
         
         return jsonify({
             'success': True,
@@ -210,6 +256,8 @@ def recalculate_leaderboards():
                     CALL sp_recalculate_cleaner_leaderboard(%s)
                 """, (data['period'],))
                 recalculated.append(f"cleaner_{data['period']}")
+
+        _leaderboard_cache.clear()
         
         return jsonify({
             'success': True,
