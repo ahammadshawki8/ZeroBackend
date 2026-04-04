@@ -24,43 +24,43 @@ def _ensure_funding_tables(cursor):
         if _funding_tables_ready:
             return
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_funds (
-            id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-            current_balance DECIMAL(12,2) NOT NULL DEFAULT 0,
-            total_added DECIMAL(12,2) NOT NULL DEFAULT 0,
-            total_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS system_funds (
+                id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                current_balance DECIMAL(12,2) NOT NULL DEFAULT 0,
+                total_added DECIMAL(12,2) NOT NULL DEFAULT 0,
+                total_paid DECIMAL(12,2) NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_fund_transactions (
-            id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-            type VARCHAR(20) NOT NULL,
-            amount DECIMAL(12,2) NOT NULL,
-            balance_after DECIMAL(12,2) NOT NULL,
-            reference_type VARCHAR(30),
-            reference_id VARCHAR(36),
-            note TEXT,
-            created_by VARCHAR(36) REFERENCES users(id),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS system_fund_transactions (
+                id VARCHAR(36) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                type VARCHAR(20) NOT NULL,
+                amount DECIMAL(12,2) NOT NULL,
+                balance_after DECIMAL(12,2) NOT NULL,
+                reference_type VARCHAR(30),
+                reference_id VARCHAR(36),
+                note TEXT,
+                created_by VARCHAR(36) REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_system_fund_transactions_created_at
-        ON system_fund_transactions(created_at DESC)
-    """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_system_fund_transactions_created_at
+            ON system_fund_transactions(created_at DESC)
+        """)
 
-    cursor.execute("""
-        INSERT INTO system_funds (current_balance, total_added, total_paid)
-        SELECT 0, 0, 0
-        WHERE NOT EXISTS (SELECT 1 FROM system_funds)
-    """)
+        cursor.execute("""
+            INSERT INTO system_funds (current_balance, total_added, total_paid)
+            SELECT 0, 0, 0
+            WHERE NOT EXISTS (SELECT 1 FROM system_funds)
+        """)
 
-    _funding_tables_ready = True
+        _funding_tables_ready = True
 
 
 def _get_wallet_row(cursor, lock=False):
@@ -266,9 +266,9 @@ def process_payments():
         
         transaction_ids = data['transaction_ids']
 
-        with db_connection.get_cursor(commit=True) as cursor:
+        # Phase 1: validate candidate payouts in read-only mode (no wallet lock yet).
+        with db_connection.get_cursor() as cursor:
             _ensure_funding_tables(cursor)
-            wallet = _get_wallet_row(cursor, lock=True)
 
             placeholders = ', '.join(['%s'] * len(transaction_ids))
             cursor.execute(f"""
@@ -280,43 +280,55 @@ def process_payments():
             """, transaction_ids)
             pending_rows = cursor.fetchall()
 
-            if not pending_rows:
-                return jsonify({'success': False, 'error': 'No pending payments found for selected transactions'}), 400
+        if not pending_rows:
+            return jsonify({'success': False, 'error': 'No pending payments found for selected transactions'}), 400
 
-            not_completed = [row['id'] for row in pending_rows if row.get('task_status') != 'COMPLETED']
-            if not_completed:
-                return jsonify({
-                    'success': False,
-                    'error': 'Some selected tasks are not completed yet',
-                    'data': {'invalid_transaction_ids': not_completed}
-                }), 400
+        not_completed = [row['id'] for row in pending_rows if row.get('task_status') != 'COMPLETED']
+        if not_completed:
+            return jsonify({
+                'success': False,
+                'error': 'Some selected tasks are not completed yet',
+                'data': {'invalid_transaction_ids': not_completed}
+            }), 400
 
-            total_amount = sum(_amount_to_float(row['amount']) for row in pending_rows)
+        paid_ids = [row['id'] for row in pending_rows]
+        expected_total_amount = sum(_amount_to_float(row['amount']) for row in pending_rows)
+
+        # Phase 2: short critical section with wallet row lock and atomic payout update.
+        with db_connection.get_cursor(commit=True) as cursor:
+            _ensure_funding_tables(cursor)
+            wallet = _get_wallet_row(cursor, lock=True)
+
             current_balance = _amount_to_float(wallet['current_balance']) if wallet else 0
-
-            if current_balance < total_amount:
+            if current_balance < expected_total_amount:
                 return jsonify({
                     'success': False,
                     'error': 'Insufficient system balance. Please add funds before confirming payout.',
                     'data': {
-                        'required_amount': total_amount,
+                        'required_amount': expected_total_amount,
                         'available_balance': current_balance,
-                        'shortfall': total_amount - current_balance,
+                        'shortfall': expected_total_amount - current_balance,
                     }
                 }), 400
 
-            paid_ids = [row['id'] for row in pending_rows]
-            paid_placeholders = ', '.join(['%s'] * len(paid_ids))
-
-            cursor.execute(f"""
+            cursor.execute("""
                 UPDATE earnings_transactions
                 SET status = 'PAID',
                     paid_at = CURRENT_TIMESTAMP,
                     paid_by = %s
-                WHERE id IN ({paid_placeholders})
-            """, [admin_id] + paid_ids)
+                WHERE id = ANY(%s)
+                  AND status = 'PENDING'
+                RETURNING id, amount
+            """, (admin_id, paid_ids))
+            paid_rows = cursor.fetchall()
 
+            if not paid_rows:
+                return jsonify({'success': False, 'error': 'Selected transactions are no longer pending'}), 409
+
+            paid_ids = [row['id'] for row in paid_rows]
+            total_amount = sum(_amount_to_float(row['amount']) for row in paid_rows)
             new_balance = current_balance - total_amount
+
             cursor.execute("""
                 UPDATE system_funds
                 SET current_balance = %s,
@@ -353,6 +365,8 @@ def process_payments():
         }), 200
     
     except Exception as e:
+        if "couldn't get a connection" in str(e).lower():
+            return jsonify({'success': False, 'error': 'Payment service is busy. Please retry in a few seconds.'}), 503
         return jsonify({'success': False, 'error': str(e)}), 500
     finally:
         if lock_acquired:

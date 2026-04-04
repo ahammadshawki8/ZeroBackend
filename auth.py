@@ -76,6 +76,12 @@ def _jwt_claims_only_enabled() -> bool:
     return _to_bool(os.getenv('AUTH_USE_JWT_CLAIMS_ONLY', 'true'))
 
 
+def _claims_missing_required_profile_fields(user: dict) -> bool:
+    """Older tokens may miss fields added later; detect when DB hydration is needed."""
+    required = ('id', 'email', 'role', 'name')
+    return any(not user.get(field) for field in required)
+
+
 def token_required(f):
     """Decorator to protect routes with JWT authentication"""
     @wraps(f)
@@ -116,6 +122,17 @@ def token_required(f):
                     'is_active': data.get('is_active', True),
                     'is_superadmin': data.get('is_superadmin', False),
                 }
+
+                # Compatibility path: hydrate from DB only when old tokens lack key claims.
+                if _claims_missing_required_profile_fields(current_user):
+                    cached_user = _get_cached_user(user_id)
+                    if cached_user:
+                        current_user = cached_user
+                    else:
+                        fetched_user = users_model.find_by_id(user_id)
+                        if fetched_user:
+                            _set_cached_user(user_id, fetched_user)
+                            current_user = fetched_user
             else:
                 current_user = _get_cached_user(user_id)
                 if not current_user:

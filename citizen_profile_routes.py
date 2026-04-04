@@ -113,11 +113,11 @@ def get_profile():
         # Flatten the response to match frontend expectations
         flattened_profile = {
             'userId': user['id'],
-            'name': user['name'],
-            'email': user['email'],
-            'phone': user['phone'],
-            'address': user['address'],
-            'avatarUrl': user['avatar_url'],
+            'name': user.get('name'),
+            'email': user.get('email'),
+            'phone': user.get('phone'),
+            'address': user.get('address'),
+            'avatarUrl': user.get('avatar_url'),
             'greenPoints': profile['green_points_balance'] if profile else 0,
             'totalReports': profile['total_reports'] if profile else 0,
             'approvedReports': profile['approved_reports'] if profile else 0,
