@@ -48,6 +48,20 @@ services:
         value: 300
       - key: DB_POOL_TIMEOUT
         value: 8
+      - key: DB_AUTO_POOL_RESET_ON_TIMEOUT
+        value: true
+      - key: DB_AUTO_POOL_RESET_COOLDOWN_SEC
+        value: 45
+      - key: DB_AUTO_POOL_RESET_TERMINATE_SESSIONS
+        value: false
+      - key: DB_AUTO_POOL_RESET_TERMINATE_ONLY_CURRENT_USER
+        value: true
+      - key: DB_CIRCUIT_BREAKER_ENABLED
+        value: true
+      - key: DB_CIRCUIT_BREAKER_THRESHOLD
+        value: 3
+      - key: DB_CIRCUIT_BREAKER_OPEN_SEC
+        value: 4
       - key: DB_QUERY_RETRIES
         value: 2
       - key: DB_QUERY_RETRY_DELAY

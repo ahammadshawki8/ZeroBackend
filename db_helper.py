@@ -92,6 +92,116 @@ class DatabaseConnection:
         self.min_conn = min_conn
         self.max_conn = max_conn
         self._pool_reset_lock = Lock()
+        self._last_auto_reset_ts = 0.0
+        self._route_breakers: Dict[str, Dict[str, Any]] = {}
+        self._route_breakers_lock = Lock()
+
+    def _db_circuit_breaker_enabled(self) -> bool:
+        return os.getenv('DB_CIRCUIT_BREAKER_ENABLED', 'true').lower() == 'true'
+
+    def _db_circuit_breaker_threshold(self) -> int:
+        try:
+            return max(1, int(os.getenv('DB_CIRCUIT_BREAKER_THRESHOLD', '3')))
+        except Exception:
+            return 3
+
+    def _db_circuit_breaker_open_seconds(self) -> float:
+        try:
+            return max(1.0, float(os.getenv('DB_CIRCUIT_BREAKER_OPEN_SEC', '4')))
+        except Exception:
+            return 4.0
+
+    def _db_circuit_breaker_key(self) -> str:
+        try:
+            if has_request_context and has_request_context() and request is not None:
+                return f"{request.method} {request.path}"
+        except Exception:
+            pass
+        return 'non-request-context'
+
+    def _circuit_get_retry_after(self, key: str) -> float:
+        now = time.time()
+        with self._route_breakers_lock:
+            state = self._route_breakers.get(key)
+            if not state:
+                return 0.0
+            open_until = float(state.get('open_until', 0.0) or 0.0)
+            remaining = open_until - now
+            return remaining if remaining > 0 else 0.0
+
+    def _circuit_mark_failure(self, key: str, reason: str) -> None:
+        if not self._db_circuit_breaker_enabled():
+            return
+        now = time.time()
+        threshold = self._db_circuit_breaker_threshold()
+        open_sec = self._db_circuit_breaker_open_seconds()
+
+        with self._route_breakers_lock:
+            state = self._route_breakers.get(key, {'failures': 0, 'open_until': 0.0})
+            open_until = float(state.get('open_until', 0.0) or 0.0)
+
+            # If breaker was open but expired, start a fresh failure count.
+            if open_until > 0 and now >= open_until:
+                state = {'failures': 0, 'open_until': 0.0}
+
+            state['failures'] = int(state.get('failures', 0)) + 1
+            if state['failures'] >= threshold:
+                state['open_until'] = now + open_sec
+                state['failures'] = 0
+                print(
+                    f"DB CIRCUIT OPEN key={key} reason={reason} open_for_sec={open_sec}"
+                )
+
+            self._route_breakers[key] = state
+
+    def _circuit_mark_success(self, key: str) -> None:
+        if not self._db_circuit_breaker_enabled():
+            return
+        with self._route_breakers_lock:
+            if key in self._route_breakers:
+                self._route_breakers.pop(key, None)
+
+    def _auto_pool_reset_enabled(self) -> bool:
+        """Whether automatic pool recovery should run on acquisition timeouts."""
+        return os.getenv('DB_AUTO_POOL_RESET_ON_TIMEOUT', 'true').lower() == 'true'
+
+    def _auto_pool_reset_cooldown_seconds(self) -> float:
+        """Minimum seconds between automatic recovery attempts."""
+        try:
+            return max(1.0, float(os.getenv('DB_AUTO_POOL_RESET_COOLDOWN_SEC', '45')))
+        except Exception:
+            return 45.0
+
+    def _auto_pool_reset_terminate_sessions(self) -> bool:
+        """Whether automatic recovery should terminate server sessions."""
+        return os.getenv('DB_AUTO_POOL_RESET_TERMINATE_SESSIONS', 'false').lower() == 'true'
+
+    def _auto_pool_reset_terminate_only_current_user(self) -> bool:
+        """Keep emergency automation conservative by default."""
+        return os.getenv('DB_AUTO_POOL_RESET_TERMINATE_ONLY_CURRENT_USER', 'true').lower() == 'true'
+
+    def _attempt_auto_pool_recovery(self, reason: str) -> bool:
+        """Try a guarded emergency pool reset and return True when recovery succeeded."""
+        if not self._auto_pool_reset_enabled():
+            return False
+
+        now = time.time()
+        cooldown = self._auto_pool_reset_cooldown_seconds()
+        if now - self._last_auto_reset_ts < cooldown:
+            return False
+
+        self._last_auto_reset_ts = now
+        try:
+            result = self.force_reset_pool(
+                terminate_sessions=self._auto_pool_reset_terminate_sessions(),
+                terminate_only_current_user=self._auto_pool_reset_terminate_only_current_user(),
+            )
+            ok = bool(result.get('pool_recreated'))
+            print(f"AUTO DB POOL RESET reason={reason} success={ok} result={result}")
+            return ok
+        except Exception as recovery_error:
+            print(f"AUTO DB POOL RESET FAILED reason={reason} error={recovery_error}")
+            return False
 
     def create_pool(self):
         """Create a connection pool with configured bounds; returns True on success."""
@@ -199,20 +309,33 @@ class DatabaseConnection:
     @contextmanager
     def get_cursor(self, commit=False):
         """Yield a cursor from the pool; commit or rollback based on execution outcome."""
+        route_key = self._db_circuit_breaker_key()
+        retry_after = self._circuit_get_retry_after(route_key)
+        if retry_after > 0:
+            raise RuntimeError(
+                f"DB circuit breaker open for {route_key}; retry after {retry_after:.2f}s"
+            )
+
         if PSYCOPG_VERSION == 3:
             self._ensure_pool()
             # psycopg3 uses connection context manager
             retries = max(0, int(os.getenv('DB_POOL_ACQUIRE_RETRIES', '0')))
-            for attempt in range(retries + 1):
+            max_attempts = retries + 1
+            attempt = 0
+            auto_recovery_used = False
+
+            while attempt < max_attempts:
+                attempt += 1
                 try:
                     acquire_started = time.perf_counter()
                     with self.connection_pool.connection() as connection:
+                        self._circuit_mark_success(route_key)
                         acquired_ms = (time.perf_counter() - acquire_started) * 1000
                         route_label = _request_label()
                         if _diag_enabled() and acquired_ms >= _diag_acquire_warn_ms():
                             print(
                                 f"DB acquire slow ({acquired_ms:.1f} ms) route={route_label} "
-                                f"commit={commit} attempt={attempt + 1}/{retries + 1}"
+                                f"commit={commit} attempt={attempt}/{max_attempts}"
                             )
 
                         with connection.cursor(row_factory=dict_row) as cursor:
@@ -248,26 +371,50 @@ class DatabaseConnection:
 
                     print(
                         f"Pool timeout while acquiring DB connection (max_conn={self.max_conn}, "
-                        f"attempt={attempt + 1}/{retries + 1}, stats={pool_stats})."
+                        f"attempt={attempt}/{max_attempts}, stats={pool_stats})."
                     )
 
-                    if attempt < retries:
+                    if attempt <= retries:
                         time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
                         continue
+
+                    if not auto_recovery_used and self._attempt_auto_pool_recovery('pool-timeout'):
+                        auto_recovery_used = True
+                        max_attempts += 1
+                        time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
+                        continue
+
+                    self._circuit_mark_failure(route_key, 'pool-timeout')
+
                     raise
                 except Exception as exc:
                     message = str(exc).lower()
-                    if attempt < retries and ('pool closed' in message or 'pool is closed' in message):
+                    if attempt <= retries and ('pool closed' in message or 'pool is closed' in message):
                         self._close_pool_safely()
                         self._ensure_pool()
                         time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
                         continue
+
+                    if (
+                        ('pool closed' in message or 'pool is closed' in message or "couldn't get a connection" in message)
+                        and not auto_recovery_used
+                        and self._attempt_auto_pool_recovery('pool-closed-or-exhausted')
+                    ):
+                        auto_recovery_used = True
+                        max_attempts += 1
+                        time.sleep(float(os.getenv('DB_POOL_RETRY_DELAY', '0.15')))
+                        continue
+
+                    if 'pool closed' in message or 'pool is closed' in message or "couldn't get a connection" in message:
+                        self._circuit_mark_failure(route_key, 'pool-closed-or-exhausted')
+
                     raise
         else:
             # psycopg2 manual connection management
             self._ensure_pool()
             acquire_started = time.perf_counter()
             connection = self.connection_pool.getconn()
+            self._circuit_mark_success(route_key)
             acquired_ms = (time.perf_counter() - acquire_started) * 1000
             route_label = _request_label()
             if _diag_enabled() and acquired_ms >= _diag_acquire_warn_ms():
